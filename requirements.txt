@@ -1,0 +1,6 @@
+# .venv is not committed; recreate with:
+#   python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# torch 2.6.0 ships CUDA 12.4 wheels with Pascal (sm_61) kernels — required
+# for the GTX 1070. Do not upgrade torch without checking sm_61 support.
+torch==2.6.0
+numpy

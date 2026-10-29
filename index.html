@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Classifier</title>
+<style>
+  :root { color-scheme: dark light; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  .sub { opacity: .65; font-size: .9rem; }
+  input { width: 100%; box-sizing: border-box; padding: .6rem .8rem; font: inherit;
+          border: 1px solid #8884; border-radius: 8px; background: transparent; }
+  button { font: inherit; padding: .55rem 1.1rem; border: 1px solid #8884; border-radius: 8px;
+           background: transparent; cursor: pointer; }
+  button.primary { border-color: transparent; background: #4a7; color: #fff; }
+  .row { display: flex; gap: .5rem; margin-top: .8rem; }
+  .chips { margin-top: 1rem; display: flex; flex-wrap: wrap; gap: .4rem; }
+  .chip { font-size: .85rem; padding: .3rem .6rem; border-radius: 999px; border: 1px solid #8884;
+          cursor: pointer; background: transparent; }
+  #out { margin-top: 1.2rem; font-size: 1.05rem; min-height: 1.6rem; }
+  .label { font-weight: 700; }
+  .meta { opacity: .6; font-size: .85rem; margin-top: .2rem; }
+  .err { color: #c55; }
+  #probs { margin-top: .9rem; display: flex; flex-direction: column; gap: .3rem; }
+  .prow { display: grid; grid-template-columns: 7rem 1fr 3.2rem; align-items: center; gap: .55rem; font-size: .8rem; }
+  .pname { opacity: .8; white-space: nowrap; }
+  .ptrack { height: .5rem; border-radius: 4px; background: #8882; overflow: hidden; }
+  .pfill { display: block; height: 100%; background: #8885; border-radius: 4px; }
+  .pfill.top { background: #4a7; }
+  .pval { text-align: right; opacity: .6; font-variant-numeric: tabular-nums; }
+  #breakdown { margin-top: .8rem; font-size: .85rem; opacity: .75; }
+  #breakdown b { opacity: 1; }
+</style>
+</head>
+<body>
+  <h1>Classifier</h1>
+  <div class="sub">two-layer NN &middot; ~11.3MB &middot; label out, no wall of text</div>
+  <div class="row">
+    <input id="q" placeholder='e.g.  p | ~p   or   the movie was great' autofocus>
+    <button class="primary" id="go">Classify</button>
+  </div>
+  <div class="chips" id="chips"></div>
+  <div id="out"></div>
+  <div id="probs"></div>
+  <div id="breakdown"></div>
+  <div class="meta" id="meta"></div>
+
+<script>
+const EXAMPLES = ["p | ~p", "p & ~p", "(p -> q) | (q -> p)",
+                 "3+4=7", "2*3=6",
+                 "the movie was wonderful", "i hated the food",
+                 "the book was average", "the trip was not good"];
+const chips = document.getElementById("chips");
+for (const e of EXAMPLES) {
+  const c = document.createElement("button");
+  c.className = "chip"; c.textContent = e;
+  c.onclick = () => { q.value = e; run(); };
+  chips.appendChild(c);
+}
+const q = document.getElementById("q");
+const out = document.getElementById("out");
+const meta = document.getElementById("meta");
+const probs = document.getElementById("probs");
+const breakdown = document.getElementById("breakdown");
+q.addEventListener("keydown", e => { if (e.key === "Enter") run(); });
+document.getElementById("go").onclick = run;
+
+async function run() {
+  const text = q.value.trim();
+  if (!text) return;
+  out.innerHTML = '<span class="meta">…</span>';
+  probs.innerHTML = "";
+  breakdown.innerHTML = "";
+  meta.textContent = "";
+  try {
+    const r = await fetch("/predict", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || r.statusText);
+    const entries = Object.entries(d.probabilities).sort((a, b) => b[1] - a[1]);
+    out.innerHTML = `<span class="label">${d.name}</span> ` +
+      `<span class="meta">(class ${d.label} · ${(d.confidence * 100).toFixed(1)}% confident · margin ${(d.margin * 100).toFixed(1)}%)</span>`;
+    probs.innerHTML = entries.map(([n, p], i) =>
+      `<div class="prow"><span class="pname">${n}</span>` +
+      `<span class="ptrack"><span class="pfill${i === 0 ? " top" : ""}" style="width:${(p * 100).toFixed(1)}%"></span></span>` +
+      `<span class="pval">${(p * 100).toFixed(1)}%</span></div>`).join("");
+    breakdown.innerHTML = d.l2_changed
+      ? `L1 base parser alone said <b>${d.l1.name}</b> (${(d.l1.confidence * 100).toFixed(0)}%) — the <b>L2 skill layer changed the call</b> to ${d.name}.`
+      : `L1 base parser alone said <b>${d.l1.name}</b> (${(d.l1.confidence * 100).toFixed(0)}%) — L2 agreed, no change.`;
+    meta.textContent = `${d.ms} ms on GPU`;
+  } catch (e) {
+    out.innerHTML = `<span class="err">${e.message}</span>`;
+    probs.innerHTML = "";
+    breakdown.innerHTML = "";
+  }
+}
+</script>
+</body>
+</html>
