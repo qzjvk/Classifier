@@ -191,7 +191,7 @@ def svd_compress(model, target_bytes=12 * 1024 * 1024):
     if _size(model) <= target_bytes:
         print(f"  SVD: model {_size(model)/1e6:.2f}MB <= {target_bytes/1e6:.0f}MB, skipping")
         return model
-    for name, mod in [("conv2", model.l1.conv2), ("conv1", model.l1.conv1)]:
+    for i, mod in reversed(list(enumerate(model.l1.convs))):
         if _size(model) <= target_bytes:
             break
         w = mod.weight
@@ -207,7 +207,7 @@ def svd_compress(model, target_bytes=12 * 1024 * 1024):
                 break
         w_new = (U[:, :r] * S[:r]).mm(Vt[:r])
         mod.weight = nn.Parameter(w_new.reshape(out_c, in_c, k))
-        print(f"  SVD: {name} rank {min(out_c, in_c * k)} -> {r}")
+        print(f"  SVD: conv{i} rank {min(out_c, in_c * k)} -> {r}")
     print(f"  SVD: final size {_size(model)/1e6:.2f}MB")
     return model
 

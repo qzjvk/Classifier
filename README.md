@@ -7,8 +7,8 @@ Trained and served on a GTX 1070.
 
 **Current state:** base task = propositional logic (TAUT/CONTRAD/CONTINGENT),
 skill 1 = English text sentiment (POS/NEG/NEU), skill 2 = arithmetic
-(TRUE/FALSE), trained from `./dataset/` — logic 97.1% val, text 100% val,
-arithmetic 99.3% val. Every prediction returns a rich payload
+(TRUE/FALSE), trained from `./dataset/` — logic 97.6% val, text 100% val,
+arithmetic 99.4% val. Every prediction returns a rich payload
 (probabilities + L1-vs-L2 breakdown) via `serve.py` / `inference.py`.
 Skills coexist: each owns a memory slot + expert + raw-char encoder, so
 training skill j never overwrites skill k — see "Extending the model"
@@ -25,11 +25,13 @@ Classifier/
 ├── serve.py         # web demo server (stdlib http, port 8377)
 ├── index.html       # web demo page
 ├── requirements.txt # torch 2.6.0 (cu124 build, has sm_61 kernels) + numpy
-├── classifier.pt    # trained weights (full state dict, 11.85MB)
+├── classifier.pt    # trained weights (full state dict, 10.79MB)
 ├── dataset/         # logic base + text + arithmetic skills (regenerate: data.py --write)
 ├── _verify.py       # diagnostic: accuracy, router, latency, per-op profile on the saved model
 ├── _bench.py        # diagnostic: L1-only vs L1+L2 latency, CUDA profile
 ├── _smoke.py        # diagnostic: model smoke test (shapes, grads, identity at init)
+├── _diag.py         # diagnostic: per-domain error analysis (confusion, length buckets, samples)
+├── _exp_l1.py       # ablation: L1 variants (2-conv RF-5 vs dilated TCN) on the logic task
 └── .venv/           # NOT committed: python 3.13 + torch 2.6.0+cu124 (has sm_61 kernels)
 ```
 
@@ -45,9 +47,10 @@ input (text, <=96 chars)
     v
 L1  parsing model (trained on logic)
      char embedding (55 x 256, pad id 0)
-     causal conv1d 256 -> 512, k=3   (left-only pad, unidirectional)
-     causal conv1d 512 -> 512, k=3   (receptive field: 5 chars)
-     masked mean pool -> 512-d rep h1
+     4x causal conv1d 256 -> 256, k=3, dilation 1, 1, 2, 4
+        (left-only pad, unidirectional; receptive field: 17 chars)
+     masked mean pool -> 256-d
+     Linear 256 -> 512 -> rep h1
     |
     v
 L2  skills parser (per-skill experts + multi-slot memory + domain router)
@@ -67,8 +70,11 @@ head  Linear(512 -> C)  -> logits -> label
 ```
 
 - **L1** (`L1ParsingModel` in `classifier.py`) is the parsing model, trained
-  on logic. Causal convs only: position *t* sees chars *t-2..t*, no
-  attention, no bidirectional pass. Pooled to a fixed 512-d vector.
+  on logic. Causal convs only: no attention, no bidirectional pass. The
+  4-layer dilated stack (dilations 1, 1, 2, 4) gives position *t* a
+  receptive field of 17 chars — long enough to track deeply nested
+  formulas, which are the hard part of the logic task. Pooled to 256-d,
+  then projected to the fixed 512-d h1.
 - **L2** (`L2SkillsParser`) is the skills parser. A small **domain router**
   over the raw chars (char histogram + one linear, independent of L1's h1)
   picks one of K experts (K = n_slots). Expert k is an MLP (768 -> 192 ->
@@ -80,8 +86,9 @@ head  Linear(512 -> C)  -> logits -> label
   parser, frozen during skill training — its h1 never learned what digits or
   sentiment words mean. Each expert owns a tiny char conv stack (RF 7) so a
   skill can be learned from h1 + text instead of asking an adapter to
-  recover char detail from h1. This is what carries the arithmetic skill:
-  L1 alone gets 31.2% on arithmetic, L1+L2 gets 99.3%.
+  recover char detail from h1. This is what carries the skills: L1 alone
+  gets 0.0% on text and arithmetic (its h1 + frozen base rows know no
+  digits or sentiment words), L1+L2 gets 100% and 99.4%.
 - **Multi-slot memory**: `l2.memory` is (K x 128) — one 128-d slot per
   expert. Each skill owns its slot + expert + text encoder, so training
   skill j never overwrites skill k (k != j): skills coexist. The base task
@@ -92,7 +99,7 @@ head  Linear(512 -> C)  -> logits -> label
   inference time (`inference.py` / `serve.py` rebuild the head from the
   state dict). During skill training the head's base-task rows are frozen
   so skill gradients can't pull them off h1 (see "Training pipeline").
-- **Size**: 2.96M params, 11.85MB fp32. Compact by design (12MB budget).
+- **Size**: 2.70M params, 10.79MB fp32. Compact by design (12MB budget).
 
 ### Inference path
 
@@ -100,7 +107,8 @@ head  Linear(512 -> C)  -> logits -> label
 ids (`encode()`). `use_l2=False` bypasses L2 (router + experts) and returns
 L1 + full-head output — a diagnostic for what L1 knows without the skill
 experts (note: with the multi-class head, skill rows can fire on base-task
-inputs, so this number is lower than the 3-class L1 number from phase 1).
+inputs and drag this below the 3-class phase-1 number; with the current
+weights they rarely do).
 `predict(text)` is the single-string argmax wrapper. `predict_rich(text)`
 runs the forward twice (L1-only and L1+L2, sharing L1's h1) and returns the
 full payload: final label, confidence, top-2 margin, per-class
@@ -156,12 +164,12 @@ different number of classes or skills.
 
 | phase | what | frozen | hyperparams | time |
 |---|---|---|---|---|
-| 1. L1 | L1 + head on base task (CE) | L2 | 4 ep, Adam 1e-3, batch 512 | ~5 min |
-| 2. Skill k (each) | L2 + head on skill k **with 50/50 replay of base task + prior skills** (CE); head expands n→n+n_skill (old rows copied, new rows ~0-init); **head's base-task rows frozen**; router trained by domain CE (weight 0.1) | L1 | 20 ep, Adam 1e-3, batch 512 | ~5–10 min/skill |
+| 1. L1 | L1 + head on base task (CE) | L2 | 4 ep, Adam 1e-3, batch 512 | ~4 min |
+| 2. Skill k (each) | L2 + head on skill k **with 50/50 replay of base task + prior skills** (CE); head expands n→n+n_skill (old rows copied, new rows ~0-init); **head's base-task rows frozen**; router trained by domain CE (weight 0.1) | L1 | 20 ep, Adam 1e-3, batch 512 | ~4 min/skill |
 | 3. SVD | low-rank pass over L1 convs | — | budget 12MB (no-op if under) | instant |
 | 4. Bench + save | latency (batch 1) + `torch.save` state dict | — | — | ~10 s |
 
-Total ~20–25 min for 2 skills (24 min in the last full run on this box).
+Total ~13 min for 2 skills (last full run on this box).
 Deterministic: `torch.manual_seed(0)` + seeded data (`data.py --write` for
 `./dataset/`, or `make_splits(seed=0)` for the stand-in).
 
@@ -228,12 +236,13 @@ forward twice per request (L1-only + L1+L2, sharing L1's h1).
   `nvidia-smi` before trusting latency numbers.
 - **OOM**: the 1070's pool fragments after L1 training; run with
   `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` to be safe.
-- **Hardcoded 512**: the hidden dim is fixed at 512 — it's the default in
-  `classifier.py` (L1 hidden, L2 in/out, head input) and hardcoded in the
+- **Hardcoded 512**: the h1 dim is fixed at 512 — it's the default in
+  `classifier.py` (L1 `out_dim`, L2 in/out, head input) and hardcoded in the
   head constructions in `train.py` (`nn.Linear(512, n)`). If you change L1's
-  width, update both. The expert MLP input is tied to it too:
+  output width, update both. The expert MLP input is tied to it too:
   512 (h1) + 128 (memory) + 128 (text) = 768, via the `L2SkillsParser`
-  defaults (`in_dim`, `mem_dim`, `text_dim`).
+  defaults (`in_dim`, `mem_dim`, `text_dim`). L1's internal conv width
+  (256) is free to change as long as `out_dim` stays 512.
 - **No numpy-free assumption**: `.venv` has numpy (used by `data.py` truth
   tables and `to_tensor`).
 
@@ -244,30 +253,33 @@ seed 0, current pipeline, last full run on this box)
 
 | stage                        | logic val | text val | arithmetic val |
 |------------------------------|-----------|----------|----------------|
-| L1 only (after phase 1, 3-class head) | 94.97% | — | — |
-| after skill 1 (20 ep, replay) | 96.77%   | 100%     | —              |
-| after skill 2 (20 ep, replay) | 97.14%   | 100%     | 99.30%         |
-| after SVD (skipped, in budget)| 97.14%   | 100%     | 99.30%         |
+| L1 only (after phase 1, 3-class head) | 97.37% | — | — |
+| after skill 1 (20 ep, replay) | 97.52%   | 100%     | —              |
+| after skill 2 (20 ep, replay) | 97.55%   | 100%     | 99.39%         |
+| after SVD (skipped, in budget)| 97.55%   | 100%     | 99.39%         |
 
 Router domain accuracy (val): 100% on all three domains (logic, text,
 arithmetic).
 
 L1-only diagnostic (L1 + full 8-class head, no skill experts — not the
-serving path): logic 77.1%, text 0.0%, arithmetic 31.2%.
+serving path): logic 97.4%, text 0.0%, arithmetic 0.0%. With the current
+weights the skill head rows rarely fire on base-task inputs, so this is
+~equal to the 3-class phase-1 number.
 
-Model size: **11.85MB** (2.96M params, fp32). Latency (batch 1, GTX 1070,
-idle GPU): **~510µs/request** for one L1+L2 forward pass (~280µs L1-only);
-the rich payload runs two passes (L1-only + L1+L2, sharing L1's h1), so
-~1ms plus HTTP overhead through the web server.
+Model size: **10.79MB** (2.70M params, fp32). Latency (batch 1, GTX 1070):
+**~580µs/request** for one L1+L2 forward pass (~340µs L1-only), measured
+while another workload shared the GPU — see the shared-GPU gotcha. The rich
+payload runs two passes (L1-only + L1+L2, sharing L1's h1), so ~1ms plus
+HTTP overhead through the web server.
 
 Notes:
 - **Skills coexist**: skill 1 (text) is 100% after skill 2 (arithmetic)
   training — not overwritten. Each skill owns its expert + memory slot +
   text encoder, so training skill j never touches skill k.
-- **Base task intact**: logic is 97.14% after both skills (50/50 replay
+- **Base task intact**: logic is 97.55% after both skills (50/50 replay
   holds it; without replay, logic val collapses to 0%).
 - **L2 retains what L1 doesn't know**: text 100% vs 0.0% for L1 alone;
-  arithmetic 99.3% vs 31.2% for L1 alone. The per-expert raw-char encoder
+  arithmetic 99.4% vs 0.0% for L1 alone. The per-expert raw-char encoder
   gives skills direct access to digits and words the frozen logic parser
   never learned.
 - **Ground truth is computed exactly** (truth tables / templates by

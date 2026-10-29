@@ -42,21 +42,34 @@ def encode(text: str) -> list[int]:
 
 
 class L1ParsingModel(nn.Module):
-    """Parsing model trained on logic. Causal convs only (no attention)."""
+    """Parsing model trained on logic. Causal convs only (no attention).
 
-    def __init__(self, emb_dim=256, hidden=512):
+    Dilated causal conv stack (TCN-style): receptive field
+    1 + sum(2*dilation) = 17 chars at the default dilations (1, 1, 2, 4).
+    256-wide layers keep the full model under the 12MB budget; a final
+    linear projects the pooled rep to the 512-d h1 the head and experts
+    expect. The old 2-conv RF-5 stack collapsed on long, deeply nested
+    formulas (the hard part of the logic task); on the real dataset the
+    4ep phase-1 run gets 95.2% val with RF-5 vs 97.4% with this stack
+    (see _exp_l1.py for the ablation), ~1MB smaller in the process."""
+
+    def __init__(self, emb_dim=256, hidden=256, out_dim=512,
+                 dilations=(1, 1, 2, 4)):
         super().__init__()
         self.emb = nn.Embedding(len(VOCAB), emb_dim, padding_idx=PAD)
-        self.conv1 = nn.Conv1d(emb_dim, hidden, kernel_size=3, padding=0)
-        self.conv2 = nn.Conv1d(hidden, hidden, kernel_size=3, padding=0)
+        self.convs = nn.ModuleList(
+            [nn.Conv1d(hidden, hidden, kernel_size=3, dilation=d)
+             for d in dilations])
+        self.proj = nn.Linear(hidden, out_dim)
 
     def forward(self, x):
-        # x: (B, L) char ids -> (B, hidden); causal via left-only padding
-        h = self.emb(x).transpose(1, 2)            # (B, E, L)
-        h = F.relu(self.conv1(F.pad(h, (2, 0))))   # (B, H, L)
-        h = F.relu(self.conv2(F.pad(h, (2, 0))))   # (B, H, L)
+        # x: (B, L) char ids -> (B, out_dim); causal via left-only padding
+        h = self.emb(x).transpose(1, 2)            # (B, H, L)
+        for c in self.convs:
+            h = F.relu(c(F.pad(h, (2 * c.dilation[0], 0))))  # (B, H, L)
         mask = (x != PAD).float().unsqueeze(1)     # (B, 1, L)
-        return (h * mask).sum(2) / mask.sum(2).clamp(min=1.0)
+        h = (h * mask).sum(2) / mask.sum(2).clamp(min=1.0)
+        return self.proj(h)
 
 
 class _SkillTextEncoder(nn.Module):
